@@ -28,6 +28,8 @@ Install the Python dependencies:
 make install
 ```
 
+CodeAnchor supports Linux and macOS natively, and Windows through WSL. The Makefile and bundled `sample-app` setup use Bash.
+
 Use CodeAnchor in any of three ways.
 
 **Stop hook.** Install it once to run advisory verification automatically when a Codex session ends:
@@ -87,6 +89,8 @@ flowchart TD
 ## How it was built with Codex
 
 The Stop hook, real-schema rollout parser, and production hardening were built in Codex sessions during OpenAI Build Week. The hardening includes session-bounded git evidence, CODEOWNERS-derived constraints, and directory-boundary-aware protected-path matching. This work extends the pre-existing TraceMemory execution-continuity platform, which was itself built with Codex in early July; CodeAnchor adds the Codex adapter and CLI verification surface rather than replacing TraceMemory's core.
+
+The human made the key engineering decisions: use git as an independent evidence source instead of trusting the session log; bound that evidence to the session-start commit; limit GPT-5.6 to one semantic-judgment call site; and, after discovering that Codex encrypts compaction summaries, verify constraint adherence against the repository itself.
 
 The local rollout for this Build Week work is Codex session `019f85db-c295-7be2-a757-7862d69a2b3e`. The corresponding implementation history is preserved in the repository commits, including `8aad2ab`, `2ea5f01`, `13db25e`, `b834de8`, and `9ca3f36`.
 
