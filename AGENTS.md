@@ -49,19 +49,6 @@ is itself the finding — see §2.6.
 
 ## 2. Hard constraints
 
-### 2.1 Do NOT redesign the UI
-
-`UI_SOURCE_OF_TRUTH.md` in the TraceMemory repo is binding. Do not restyle,
-darken, simplify into cards, or convert the console into a different aesthetic.
-A previous version did this and v6 exists solely to undo it.
-
-- UI changes go through `scripts/patch_ui_codex_tab.py` only.
-- Use **only** CSS classes already present in `HACKATHON_UI.html`.
-- Tailwind is **precompiled into a static `<style>` block** — there is no runtime
-  Tailwind. A class not already compiled in renders as *nothing*, silently.
-  `border-l-2` and `border-amber-500` are NOT compiled in; do not use them.
-- Always run `node scripts/verify_ui_patch.js <repo>` after any UI change.
-
 ### 2.2 Do NOT modify TraceMemory core
 
 Additive only. Do not change:
@@ -150,14 +137,10 @@ tracememory/adapters/
   drift_scoring.py              DriftScorer protocol; Deterministic + GPT56;
                                 parse_drift_response() schema validation
   git_inspect.py                GitInspector, reconcile(), verify_violations()
-api/
-  codex_demo_router.py          POST /api/demo/codex-recovery
 scripts/
   setup_sample_app.sh           generates sample-app's git state
   report_capabilities.py        `make test` — maps tests to claims
   validate_against_real_rollout.py   schema check vs a REAL ~/.codex session
-  patch_ui_codex_tab.py         idempotent UI patch (+ --check / --revert)
-  verify_ui_patch.js            renders the panel; gates on CSS class validity
 tests/
   test_codex_adapter.py         parsing → drift → recovery brief, end to end
   test_drift_scoring.py         both scorers, incl. a fake GPT-5.6 client
@@ -280,37 +263,6 @@ as a CI gate.
 `RealOpenAIResponsesClient` is written to the Responses API shape but has never
 been network-tested. Smoke-test it here.
 
-### 5.5 Endpoint check
-
-```bash
-python3 -c "
-import sys; sys.path[:0]=['<tracememory>/services/api','.','api']
-import codex_demo_router as m; print(m.codex_recovery(None))"
-```
-
-Must return `objective`, `constraints`, `protected_paths`, `compaction`,
-`compaction_count`, `compactions`, `drift`, `violations`, `timeline`.
-
-### 5.6 UI patch verification
-
-```bash
-make ui-patch REPO=<tracememory-repo>
-make ui-verify REPO=<tracememory-repo>     # MUST pass
-python3 scripts/patch_ui_codex_tab.py <repo> --revert
-```
-
-The verifier asserts the panel renders **and** that every emitted CSS class
-exists in the compiled stylesheet. `undefined-in-CSS` must be `0`. The patch
-aborts rather than guessing if an anchor doesn't match — if that happens the UI
-file diverged; investigate, don't loosen the anchor.
-
-### 5.7 Manual smoke
-
-`docker compose up --build`, open `http://localhost:3000`, console →
-**Codex Recovery** → *Run Codex Recovery Demo*. Confirm other tabs still render,
-the badge reads **Live runtime** with the backend up and **Offline fixture**
-without it, and `--revert` cleanly restores the original file.
-
 ---
 
 ## 6. Definition of done
@@ -319,7 +271,6 @@ without it, and `--revert` cleanly restores the original file.
 - [ ] `make demo` works on a **fresh clone**, shows both violation classes
 - [ ] multi-compaction fixture shows the compounding sequence
 - [ ] `make validate` — exit 0 against a real session
-- [ ] `make ui-verify` — passes, `undefined-in-CSS: 0`
 - [ ] no diff to Context Health, existing adapters, schema, or existing routes
 - [ ] keyless path still works (unset `OPENAI_API_KEY`, re-run 5.1 and 5.2)
 - [ ] no hardcoded absolute paths anywhere

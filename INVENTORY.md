@@ -10,10 +10,7 @@ makes the boundary explicit; it should feed the README's compliance section.
 | `tracememory/adapters/codex_rollout.py` | 499 | Codex rollout JSONL parsing, task-contract extraction, markdown handling, compaction detection, drift candidates, violation detection |
 | `tracememory/adapters/codex.py` | 137 | `TraceMemoryCodexAdapter` — wires the above into TraceMemoryClient |
 | `tracememory/adapters/drift_scoring.py` | 176 | `DriftScorer` protocol; deterministic + GPT-5.6 implementations |
-| `api/codex_demo_router.py` | 116 | `POST /api/demo/codex-recovery` |
 | `scripts/validate_against_real_rollout.py` | 284 | Schema validation vs. a real `~/.codex` session |
-| `scripts/patch_ui_codex_tab.py` | 220 | Idempotent UI patch (`--check` / `--revert`) |
-| `scripts/verify_ui_patch.js` | 41 | Renders the panel; gates on CSS class validity |
 | `bin/codeanchor-hook` | â€” | Advisory Codex Stop hook for automatic task-contract verification |
 | `scripts/install_codex_hook.py` | â€” | Idempotent user-level hook installer (`--uninstall` / `--dry-run`) |
 | `tests/test_stop_hook.py` | â€” | Subprocess coverage for hook safety, evidence labels, and installation |
@@ -24,7 +21,7 @@ makes the boundary explicit; it should feed the README's compliance section.
 | `fixtures/sample_rollout.jsonl` | 15 | Codex session: constraint → compaction that drops it → violation |
 | `AGENTS.md` | — | Build instructions + constraints |
 | `REVIEW_NOTES.md` | — | Seven defects found in review, with fixes |
-| `README.md` | — | Setup, testing, UI patch notes |
+| `README.md` | — | Setup and testing notes |
 
 **~1,900 lines of new code + tests.**
 
@@ -43,7 +40,6 @@ makes the boundary explicit; it should feed the README's compliance section.
   exclusion threshold. `tests/fake_client.py` imports the real thing rather than
   mocking it.
 - The existing run-event vocabulary, checkpoint/restore pipeline, and receipt model.
-- `HACKATHON_UI.html` — patched by script, never rewritten.
 
 ## Not yet done
 

@@ -127,69 +127,10 @@ It also warns when a session contains **no compaction at all** — the demo's co
 claim needs one, so you may need a long session or an explicit `/compact` to
 produce a rollout that actually exercises drift detection.
 
-## Console UI — "Codex Recovery" tab
-
-`UI_SOURCE_OF_TRUTH.md` forbids redesigning the approved Continuum UI (v6 exists
-specifically to undo a previous redesign). So this adds **no new UI** — it does
-the one thing that document permits, "backend wiring around the existing demo
-structure":
-
-```bash
-python3 scripts/patch_ui_codex_tab.py <repo-root>          # apply
-python3 scripts/patch_ui_codex_tab.py <repo-root> --check   # status only
-python3 scripts/patch_ui_codex_tab.py <repo-root> --revert  # undo
-node    scripts/verify_ui_patch.js  <repo-root>             # verify
-```
-
-The patch makes exactly three edits, to all three synced copies named in
-`UI_SOURCE_OF_TRUTH.md`, and is idempotent:
-
-1. one entry appended to the existing `tabs` array and `labels` map
-2. one branch added to the existing `consoleTab` conditional
-3. a `codexRecoveryPanel()` function using **only** classes already present —
-   `pro-panel`, `pro-kicker`, `pro-copy`, `pro-timeline`, `pro-step`, `badge()`
-   and existing Tailwind utilities
-
-No new CSS, no new colours, no new layout primitives. It aborts rather than
-guessing if any anchor doesn't match the expected v6 build.
-
-### Why `verify_ui_patch.js` matters
-
-Tailwind in `HACKATHON_UI.html` is **precompiled into a static `<style>` block** —
-there is no runtime Tailwind. Any utility class not already compiled in silently
-renders as *nothing*. The verifier gates on this and caught two real cases in the
-first draft: `border-l-2` and `border-amber-500` are not in the compiled CSS, so
-the accent borders would have been invisible. Both were swapped for defined
-equivalents (`ring-1 ring-neutral-200`, `bg-amber-100 text-amber-700`).
-
-(Worth knowing: the existing agent view uses `border-l-2 border-emerald-500`,
-which has the same latent issue. Not touched — the UI is locked.)
-
-### Backend endpoint
-
-`api/codex_demo_router.py` adds one route, `POST /api/demo/codex-recovery`,
-mirroring the existing `/api/demo/failure-recovery` pattern. Mount it with:
-
-```python
-from app.codex_demo.router import router as codex_demo_router
-app.include_router(codex_demo_router)
-```
-
-It runs the real adapter against the real `ContextHealthService` — no new tables,
-no schema changes. Keyless by default; set `OPENAI_API_KEY` to swap in GPT-5.6
-drift scoring. The UI falls back to an embedded fixture result if the endpoint
-isn't reachable, so the story still runs with no backend at all.
-
-Both paths are verified: `verify_ui_patch.js` renders the panel from the offline
-fixture, and a live-render check confirms the panel renders the endpoint's actual
-JSON response with the "Live runtime" badge.
-
 ## Not yet built (Day 3, per TRD)
 
 - Live smoke test of `RealOpenAIResponsesClient` against `api.openai.com`
   (needs to happen inside Codex, where that network access exists).
-- Console UI entry point ("Run Codex Recovery Demo") reusing the existing
-  staged UI.
 - Real Codex CLI session capture (this build parses a realistic fixture;
   next step is running an actual Codex session and pointing the adapter at
   the live `~/.codex/sessions/` file).
