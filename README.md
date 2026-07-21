@@ -8,6 +8,8 @@ Codex compresses long sessions so work can continue within the context window. D
 
 CodeAnchor checks the repository itself against constraints recovered from the task. Every violation is labelled by evidence source: `log+git`, `log-only`, or `git-only`. The differentiating case is `git-only`: a protected file changed, but the session log contains no tool record that accounts for it.
 
+The verification engine is agent-agnostic: it checks a repository against declared constraints regardless of which coding agent produced the work. Codex is the first supported adapter—the rollout parser and Stop hook—because this is OpenAI Build Week and Codex's encrypted compaction summaries make the problem especially acute. The core reconciliation logic—git evidence, constraint extraction, CODEOWNERS derivation, and path matching—is not Codex-specific.
+
 ## Quickstart — see it work in one command
 
 No API key, live Codex session, or backend is required:
@@ -116,6 +118,7 @@ make test
 
 ## Roadmap
 
+- Additional agent adapters—Claude Code and Cursor—reusing the same agent-agnostic verification engine; only the session parser and hook layer are per-agent.
 - Package CodeAnchor as a GitHub App and Action for one-click adoption.
 - Produce signed, tamper-evident verification reports through TraceMemory's receipt and attestation layer.
 - Auto-derive more constraints from branch protection and generated-directory policy.
