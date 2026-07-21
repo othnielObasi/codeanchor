@@ -50,6 +50,20 @@ def find_sessions() -> list[str]:
     return sorted(found, key=os.path.getmtime, reverse=True)
 
 
+def deduplicate_git_only_violations(violations: list[dict]) -> list[dict]:
+    """Collapse repeated git-only findings in the final session result."""
+    deduplicated = []
+    seen_paths = set()
+    for violation in violations:
+        if violation.get("evidence") == "git-only":
+            path = violation.get("violating_input", {}).get("path", "")
+            if path in seen_paths:
+                continue
+            seen_paths.add(path)
+        deduplicated.append(violation)
+    return deduplicated
+
+
 def analyse(session_path: str, repo_path: str | None) -> dict:
     lines = rollout.parse_rollout_file(session_path)
     contract = rollout.extract_task_contract(lines)
@@ -123,7 +137,7 @@ def analyse(session_path: str, repo_path: str | None) -> dict:
         if extra.get("violating_input", {}).get("path") not in claimed:
             all_violations.append(extra)
 
-    result["violations"] = all_violations
+    result["violations"] = deduplicate_git_only_violations(all_violations)
     result["compaction"] = {"at": per_compaction[0]["at"], "summary": per_compaction[0]["summary"]}
     return result
 
