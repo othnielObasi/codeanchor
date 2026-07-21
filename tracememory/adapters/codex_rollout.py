@@ -643,6 +643,7 @@ def find_actual_violations(contract: TaskContract, event: CompactionEvent) -> li
     find *actual* violations (not just summary drift) -- the strongest possible
     evidence for the recovery brief / receipt."""
     post_traces = extract_tool_traces(event.post_lines)
+    from .git_inspect import path_matches_protected
 
     # Keyed by the offending tool call so a single bad edit is reported ONCE,
     # even when several differently-phrased constraints all forbid it.
@@ -652,7 +653,7 @@ def find_actual_violations(contract: TaskContract, event: CompactionEvent) -> li
         protected = _extract_protected_terms(constraint)
         for trace in post_traces:
             path = trace.input.get("path", "") or trace.input.get("command", "")
-            if not any(term in path.lower() for term in protected):
+            if not path_matches_protected(path, protected):
                 continue
             key = (trace.tool, path, trace.timestamp)
             if key in by_call:

@@ -75,6 +75,31 @@ def test_editing_the_protected_path_is_still_reported_as_violation():
     assert "billing/auth/eligibility.py" in violations[0]["violating_input"]["path"]
 
 
+def test_protected_filename_does_not_match_longer_filename_substrings():
+    contract = rollout.TaskContract(
+        objective="o",
+        constraints=["do not modify auth.py"],
+        acceptance_criteria=[],
+        raw_instruction="",
+    )
+    post = []
+    for index, path in enumerate(("billing/notauth.py", "billing/auth.py.backup")):
+        post.extend([
+            rollout.RolloutLine(
+                timestamp=f"t{index}",
+                item={"type": "response_item", "content": [{
+                    "type": "tool_call", "tool_name": "apply_patch", "input": {"path": path}
+                }]},
+            ),
+            rollout.RolloutLine(
+                timestamp=f"r{index}",
+                item={"type": "event_msg", "msg": {"type": "tool_result", "output": {"status": "applied"}}},
+            ),
+        ])
+    event = rollout.CompactionEvent(index=0, timestamp="t", summary="s", pre_lines=[], post_lines=post)
+    assert rollout.find_actual_violations(contract, event) == []
+
+
 # --- BUG 2: constraints phrased without a "not" verb were dropped entirely -----
 
 def test_without_modifying_phrasing_is_captured_as_a_constraint():

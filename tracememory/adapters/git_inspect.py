@@ -27,6 +27,7 @@ writes to the repository.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from dataclasses import dataclass, field
 from typing import Any
@@ -231,9 +232,21 @@ def session_start_ref_from_lines(lines: list[Any]) -> str | None:
 
 # --- reconciliation ---------------------------------------------------------
 
-def _matches_protected(path: str, protected_terms: list[str]) -> bool:
-    low = path.lower()
-    return any(term and term in low for term in protected_terms)
+def path_matches_protected(path: str, protected_terms: list[str]) -> bool:
+    """Match protected paths on path-component boundaries, not substrings."""
+    candidate = path.replace("\\", "/").lower()
+    for raw_term in protected_terms:
+        term = raw_term.replace("\\", "/").lower().strip().strip("/")
+        if not term:
+            continue
+        # A term may appear in a repo-relative path or a shell command. Word,
+        # dot, and hyphen boundaries prevent auth.py matching notauth.py or
+        # auth.py.backup; directory terms additionally allow descendants.
+        before = r"(?<![\w.-])"
+        after = r"(?:/|$)" if raw_term.replace("\\", "/").endswith("/") else r"(?![\w.-])"
+        if re.search(before + re.escape(term) + after, candidate):
+            return True
+    return False
 
 
 def reconcile(
@@ -268,7 +281,7 @@ def reconcile(
         result.changed_but_unclaimed.append(change.path)
 
     for change in actual:
-        if _matches_protected(change.path, protected_terms):
+        if path_matches_protected(change.path, protected_terms):
             result.protected_paths_changed.append(
                 {
                     "path": change.path,

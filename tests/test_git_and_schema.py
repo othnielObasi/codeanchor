@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tracememory.adapters.git_inspect import (
     GitError,
     GitInspector,
+    path_matches_protected,
     reconcile,
     session_start_ref_from_lines,
     verify_violations,
@@ -159,6 +160,24 @@ def test_out_of_band_change_to_protected_path_is_caught(repo):
 def test_unprotected_change_is_not_reported_as_protected(repo):
     _edit(repo, "billing/refunds.py", "\n# fine\n")
     rec = reconcile(GitInspector(repo), ["billing/refunds.py"], ["billing/auth/"])
+    assert rec.protected_paths_changed == []
+
+
+def test_file_path_matching_respects_component_boundaries():
+    assert path_matches_protected("billing/auth.py", ["auth.py"])
+    assert not path_matches_protected("billing/notauth.py", ["auth.py"])
+    assert not path_matches_protected("billing/auth.py.backup", ["auth.py"])
+
+
+def test_directory_path_matching_respects_component_boundaries():
+    assert path_matches_protected("billing/auth/eligibility.py", ["billing/auth/"])
+    assert not path_matches_protected("billing/auth-old/eligibility.py", ["billing/auth/"])
+
+
+def test_git_reconciliation_ignores_substring_lookalikes(repo):
+    _edit(repo, "billing/notauth.py", "x = 1\n")
+    _edit(repo, "billing/auth.py.backup", "x = 1\n")
+    rec = reconcile(GitInspector(repo), claimed_paths=[], protected_terms=["auth.py"])
     assert rec.protected_paths_changed == []
 
 
