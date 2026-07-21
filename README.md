@@ -126,3 +126,7 @@ make test
 - Package CodeAnchor as a GitHub App and Action for one-click adoption.
 - Produce signed, tamper-evident verification reports through TraceMemory's receipt and attestation layer.
 - Auto-derive more constraints from branch protection and generated-directory policy.
+
+## License
+
+This project is MIT licensed. See [LICENSE](LICENSE).
