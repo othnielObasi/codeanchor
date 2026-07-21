@@ -27,6 +27,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from tracememory.adapters import codex_rollout as rollout  # noqa: E402
+from tracememory.adapters.codeowners import constraints_from_codeowners  # noqa: E402
 from tracememory.adapters.drift_scoring import build_scorer_from_env  # noqa: E402
 from tracememory.adapters.git_inspect import (  # noqa: E402
     GitError,
@@ -55,10 +56,11 @@ def analyse(session_path: str, repo_path: str | None) -> dict:
 
     # Constraints may also live in the repo's AGENTS.md.
     if repo_path:
+        extra = constraints_from_codeowners(repo_path)
         agents_md = os.path.join(repo_path, "AGENTS.md")
         if os.path.exists(agents_md):
-            extra = rollout._extract_constraints(open(agents_md, encoding="utf-8").read())
-            contract.constraints = rollout._dedupe_constraints(contract.constraints + extra)
+            extra.extend(rollout._extract_constraints(open(agents_md, encoding="utf-8").read()))
+        contract.constraints = rollout._dedupe_constraints(contract.constraints + extra)
 
     protected = sorted({t for c in contract.constraints for t in rollout._extract_protected_terms(c)})
     compactions = rollout.detect_compactions(lines)
