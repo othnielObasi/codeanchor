@@ -1,146 +1,121 @@
-# TraceMemory Codex Adapter — Day 1 build
+# CodeAnchor — verify a resumed Codex session still honoured the rules you set.
 
-New work for OpenAI Build Week (Developer Tools track), built July 14–15, 2026 on top
-of the existing TraceMemory recovery pipeline. No changes to TraceMemory's API,
-database schema, or other adapters (CrewAI/LangGraph/OpenAI Agents) — this is additive.
+## The problem
 
-## What's here
+Codex compresses long sessions so work can continue within the context window. During repeated compaction, an important constraint can disappear from the context used for later work, leaving the agent unaware that it is breaking a rule. This loss mode is documented in the [openai/codex issue tracker](https://github.com/openai/codex/issues/14347). In current real rollouts, Codex records the compaction event but encrypts or omits the summary, so constraint survival cannot be verified from the session log alone.
 
-- `tracememory/adapters/codex_rollout.py` — parses Codex's real on-disk session
-  format (`~/.codex/sessions/**/rollout-*.jsonl`), extracts a task contract,
-  tool traces, and **explicit** compaction events (Codex's `RolloutItem::Compacted`
-  marker — no heuristic inference needed).
-- `tracememory/adapters/codex.py` — `TraceMemoryCodexAdapter`, structurally
-  parallel to the existing `openai_agents.py` adapter. Wires rollout parsing into
-  TraceMemory's existing `record_event` / `record_tool_trace` / `save_checkpoint`
-  / `build_context` / `recover_task` calls. Emits only TraceMemory's existing
-  required event vocabulary — no new event codes.
-- `fixtures/sample_rollout.jsonl` — a realistic Codex session: a task with a
-  hard constraint ("don't touch `auth.py`/`billing/auth/`"), a compaction event
-  whose summary silently drops that constraint, and a post-compaction tool call
-  that actually violates it.
-- `tests/fake_client.py` — an in-memory `TraceMemoryClient` test double that
-  routes `build_context()` to TraceMemory's **real, unmodified**
-  `ContextHealthService` — drift detection is exercised against actual product
-  logic, not a mock of it.
-- `tests/test_codex_adapter.py` — 8 passing tests covering parsing, task
-  contract extraction, tool trace extraction, compaction detection, drift
-  flagging via the real Context Health policy engine, actual-violation
-  detection, and the full end-to-end recovery brief.
+## What it does
 
-## Run it
+CodeAnchor checks the repository itself against constraints recovered from the task. Every violation is labelled by evidence source: `log+git`, `log-only`, or `git-only`. The differentiating case is `git-only`: a protected file changed, but the session log contains no tool record that accounts for it.
+
+## Quickstart — see it work in one command
+
+No API key, live Codex session, or backend is required:
 
 ```bash
-pip install pydantic pytest --break-system-packages
-python3 -m pytest tests/ -v
+python3 bin/codeanchor demo
 ```
 
-All 8 tests pass. To see the recovery brief the demo will show judges:
+This initializes the bundled `sample-app` repository and analyzes `fixtures/sample_rollout.jsonl`. The result contains one protected-path change confirmed by both the log and git, plus one change found only by git.
+
+## Install & usage
+
+Install the Python dependencies:
 
 ```bash
-python3 -c "
-import sys; sys.path.insert(0, 'tests')
-from tracememory.adapters.codex import TraceMemoryCodexAdapter
-from fake_client import FakeTraceMemoryClient
-
-client = FakeTraceMemoryClient()
-adapter = TraceMemoryCodexAdapter(client, task_id='demo', session_path='fixtures/sample_rollout.jsonl')
-ingest = adapter.ingest_session()
-drift = adapter.handle_compaction(ingest['compactions'][0])
-print(adapter.generate_recovery_brief(drift['checkpoint']['checkpoint_id'], drift))
-"
+make install
 ```
 
-## What the fixture proves
+Use CodeAnchor in any of three ways.
 
-1. Task starts with a hard constraint: don't touch `auth.py` / `billing/auth/`.
-2. Codex works correctly for a while (patches `refunds.py`, tests pass).
-3. Compaction happens. The summary is accurate about *progress* but drops the
-   constraint entirely.
-4. On resume, Codex — reasoning only from the compacted summary — decides to
-   "normalize refund eligibility," which lives in `billing/auth/eligibility.py`,
-   and patches it. **This is the real failure mode**: not that Codex forgot
-   the code, but that it lost the constraint governing the code.
-5. TraceMemory's Context Health engine flags the compaction summary as having
-   dropped the constraint (`ctx-stale-block-v1`, reused unmodified).
-6. The adapter separately confirms an actual violation by diffing post-compaction
-   tool calls against the constraint's protected paths.
-7. Both are surfaced together in one recovery brief — the "receipt" a developer
-   or a fresh Codex session can trust, instead of re-deriving all of this by hand.
-
-## GPT-5.6 drift scoring (added Day 2)
-
-- `tracememory/adapters/drift_scoring.py` — a `DriftScorer` Protocol with two
-  implementations: `DeterministicDriftScorer` (keyword/path overlap, current
-  default, keyless) and `GPT56DriftScorer` (calls OpenAI's Responses API with
-  GPT-5.6 for a real semantic consistency judgment — this is the **only**
-  place in the whole adapter GPT-5.6 is called; not used for parsing,
-  orchestration, or UI, per scope discipline in the PRD/TRD).
-- `build_drift_candidates(contract, event, scorer=...)` and
-  `TraceMemoryCodexAdapter(..., scorer=...)` both accept the scorer, so
-  swapping deterministic → GPT-5.6 is a one-line change once you have an
-  `OPENAI_API_KEY` inside Codex.
-- `RealOpenAIResponsesClient` is written against the real Responses API shape
-  but **not network-tested here** — this sandbox can't reach `api.openai.com`.
-  `tests/test_drift_scoring.py` proves the integration logic (prompt
-  construction, response parsing, score-threshold mapping) against a fake
-  client instead. One real bug was caught this way and fixed: a low-confidence
-  "not retained" verdict was scoring above Context Health's exclusion
-  threshold (35) and would have silently passed instead of being flagged —
-  now capped so any "not retained" verdict always surfaces for review.
-- `build_scorer_from_env()` auto-selects GPT-5.6 scoring when
-  `OPENAI_API_KEY` is set, deterministic otherwise — keeps the judge-facing
-  demo keyless while being the real production path with credentials.
-
-## Validate against a REAL Codex session first
-
-Everything above is tested against a hand-written fixture — which validates the
-adapter against *our assumptions* about Codex's format, not Codex's actual
-output. Bug 6 in `REVIEW_NOTES.md` hid behind exactly that gap.
-
-Before recording the demo, run:
+**Stop hook.** Install it once to run advisory verification automatically when a Codex session ends:
 
 ```bash
-python3 scripts/validate_against_real_rollout.py          # newest ~/.codex session
-python3 scripts/validate_against_real_rollout.py --all    # every session found
-python3 scripts/validate_against_real_rollout.py <path>   # a specific rollout file
+python3 scripts/install_codex_hook.py
 ```
 
-Read-only; exit 0 = every assumption held, exit 1 = at least one broke (and the
-report names it). It checks:
+The installer updates `~/.codex/hooks.json` idempotently and preserves other hooks. It also supports `--dry-run` and `--uninstall`. The hook prints a `systemMessage` and always allows the Stop event to complete, including when verification is unavailable.
 
-- `RolloutLine` shape (`timestamp` + `item` on every line)
-- item types against the five the adapter handles (`session_meta`,
-  `turn_context`, `response_item`, `event_msg`, `compacted`)
-- `event_msg` subtypes and `response_item` content-block types
-- `tool_call` shape, and that `apply_patch` inputs carry `path` (violation
-  detection reads `input.path`)
-- that every extractor runs, that tool calls actually pair with results, and
-  that any compaction carries a non-empty summary
+**On demand.** Analyze the newest local Codex rollout and compare it with the current repository:
 
-**Why this matters:** when run against a rollout with a changed schema, the
-adapter doesn't crash — it silently yields **zero** tool traces and **zero**
-compactions. You'd record a demo where nothing gets flagged and not know why.
-The validator turns that silent failure into a loud one.
+```bash
+python3 bin/codeanchor recover --latest --repo .
+```
 
-It also warns when a session contains **no compaction at all** — the demo's core
-claim needs one, so you may need a long session or an explicit `/compact` to
-produce a rollout that actually exercises drift detection.
+Use `--session <rollout.jsonl>` instead of `--latest` to select a specific session, and add `--json` for machine-readable output.
 
-## Not yet built (Day 3, per TRD)
+**CI gate.** The `recover` command exits `0` when the contract is honoured, `1` when it finds a violation or drift, and `2` for usage or setup errors. A workflow can analyze a captured rollout artifact directly:
 
-- Live smoke test of `RealOpenAIResponsesClient` against `api.openai.com`
-  (needs to happen inside Codex, where that network access exists).
-- Real Codex CLI session capture (this build parses a realistic fixture;
-  next step is running an actual Codex session and pointing the adapter at
-  the live `~/.codex/sessions/` file).
-- `/feedback` Codex session ID capture once building continues inside Codex
-  itself for the submission-compliance record.
+```yaml
+name: Verify Codex task contract
+on: [push]
 
-## Running this package standalone
+jobs:
+  codeanchor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: make install
+      - run: python3 bin/codeanchor recover --session artifacts/rollout.jsonl --repo .
+```
 
-`tests/fake_client.py` imports TraceMemory's real `ContextHealthService` from
-a local path (`REPO_API_PATH` at the top of the file), currently pointing at
-this build's original location on the sandbox. Update that path (or `pip
-install` your TraceMemory package) before running these tests in a fresh
-environment/inside Codex.
+Constraints come from the opening prompt and the repository's `AGENTS.md`. CodeAnchor also derives protected-path constraints from supported exact-path and whole-directory patterns in the first `CODEOWNERS` file found at `.github/CODEOWNERS`, `CODEOWNERS`, or `docs/CODEOWNERS`.
+
+## Architecture / flow
+
+```mermaid
+flowchart TD
+    A["Codex session ends"] --> B["Stop hook"]
+    B --> C["Parse rollout lines<br/>{timestamp, type, payload}"]
+    C --> D["Extract task contract<br/>prompt + AGENTS.md + CODEOWNERS"]
+    D --> E["Detect compaction event<br/>summary encrypted or omitted"]
+    E --> F["Inspect repository with read-only git<br/>bounded to the session-start commit when available"]
+    F --> G["Report violations<br/>log+git | log-only | git-only"]
+    G --> H["Stop hook returns an advisory systemMessage<br/>and never blocks"]
+    G --> I{"recover CLI result"}
+    I -->|"honoured"| J["exit 0"]
+    I -->|"violated or drift"| K["exit 1"]
+    J --> L["CI gate"]
+    K --> L
+```
+
+## How it was built with Codex
+
+The Stop hook, real-schema rollout parser, and production hardening were built in Codex sessions during OpenAI Build Week. The hardening includes session-bounded git evidence, CODEOWNERS-derived constraints, and directory-boundary-aware protected-path matching. This work extends the pre-existing TraceMemory execution-continuity platform, which was itself built with Codex in early July; CodeAnchor adds the Codex adapter and CLI verification surface rather than replacing TraceMemory's core.
+
+The local rollout for this Build Week work is Codex session `019f85db-c295-7be2-a757-7862d69a2b3e`. The corresponding implementation history is preserved in the repository commits, including `8aad2ab`, `2ea5f01`, `13db25e`, `b834de8`, and `9ca3f36`.
+
+## What's tested
+
+The full suite currently reports **85 passed and 3 skipped**. The three skipped tests are optional integrations with TraceMemory's real `ContextHealthService` and run when `TRACEMEMORY_API_PATH` points to its API source tree.
+
+Coverage includes:
+
+- real and legacy rollout schemas, task extraction, tool traces, and compaction detection
+- deterministic and GPT-5.6 drift scoring behavior, including failure handling
+- real temporary git repositories, session-start bounds, and evidence reconciliation
+- path-boundary matching, CODEOWNERS derivation, and multi-compaction aggregation
+- Stop-hook subprocess behavior, evidence labels, non-blocking failure handling, and installer idempotency
+- end-to-end adapter and CLI recovery behavior
+
+Run it with:
+
+```bash
+make test
+```
+
+## Known limitations
+
+- Non-path constraints are handled by deterministic content overlap in the keyless path and may be flagged for review rather than judged conclusively. GPT-5.6 scoring is available when `OPENAI_API_KEY` is set.
+- Drift-from-summary verification cannot run meaningfully on current real Codex sessions because compaction summaries are encrypted or omitted. CodeAnchor therefore relies on repository and tool-log evidence for those sessions.
+- Constraints must be declared in the opening prompt, `AGENTS.md`, or a supported `CODEOWNERS` path pattern. CodeAnchor does not infer arbitrary project policy.
+- CodeAnchor verifies constraint adherence, not whether the resulting code is correct or whether every requested requirement was completed.
+
+## Roadmap
+
+- Package CodeAnchor as a GitHub App and Action for one-click adoption.
+- Produce signed, tamper-evident verification reports through TraceMemory's receipt and attestation layer.
+- Auto-derive more constraints from branch protection and generated-directory policy.

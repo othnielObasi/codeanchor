@@ -182,7 +182,7 @@ make test          # capability report
 make test-quick    # raw pytest
 ```
 
-**Expect 64 passing** (61 without `TRACEMEMORY_API_PATH`, 3 skipped).
+**Expect 88 tests: 85 passing and 3 skipped** without `TRACEMEMORY_API_PATH`.
 
 `make test` reports *claims*, not counts — a green line means the capability is
 proven by named tests. A `?` means a claim has no test behind it; treat that as
@@ -267,7 +267,7 @@ been network-tested. Smoke-test it here.
 
 ## 6. Definition of done
 
-- [ ] `make test` — 64 passing (61 + 3 skipped without `TRACEMEMORY_API_PATH`)
+- [ ] `make test` — 85 passing + 3 skipped without `TRACEMEMORY_API_PATH`
 - [ ] `make demo` works on a **fresh clone**, shows both violation classes
 - [ ] multi-compaction fixture shows the compounding sequence
 - [ ] `make validate` — exit 0 against a real session
