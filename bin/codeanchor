@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""codeanchor — verify that a resumed Codex session still honours its task contract.
+
+Two execution paths:
+
+  DEMO  (no credentials, no Codex, no backend)
+      codeanchor demo
+      codeanchor recover --session fixtures/sample_rollout.jsonl --repo sample-app
+
+  LIVE  (real Codex session + optionally GPT-5.6 drift scoring)
+      codeanchor sessions
+      codeanchor recover --latest --repo .
+
+Exit codes: 0 = no violation, 1 = violation or drift found, 2 = usage/setup error.
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from tracememory.adapters import codex_rollout as rollout  # noqa: E402
+from tracememory.adapters.drift_scoring import build_scorer_from_env  # noqa: E402
+from tracememory.adapters.git_inspect import GitError, GitInspector, verify_violations  # noqa: E402
+
+CODEX_HOME = os.environ.get("CODEX_HOME", os.path.expanduser("~/.codex"))
+
+G, Y, R, B, DIM, X = "\033[32m", "\033[33m", "\033[31m", "\033[1m", "\033[2m", "\033[0m"
+if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+    G = Y = R = B = DIM = X = ""
+
+
+def find_sessions() -> list[str]:
+    found: list[str] = []
+    for sub in ("sessions", "archived_sessions"):
+        found.extend(glob.glob(os.path.join(CODEX_HOME, sub, "**", "rollout-*.jsonl"), recursive=True))
+    return sorted(found, key=os.path.getmtime, reverse=True)
+
+
+def analyse(session_path: str, repo_path: str | None) -> dict:
+    lines = rollout.parse_rollout_file(session_path)
+    contract = rollout.extract_task_contract(lines)
+
+    # Constraints may also live in the repo's AGENTS.md.
+    if repo_path:
+        agents_md = os.path.join(repo_path, "AGENTS.md")
+        if os.path.exists(agents_md):
+            extra = rollout._extract_constraints(open(agents_md, encoding="utf-8").read())
+            contract.constraints = rollout._dedupe_constraints(contract.constraints + extra)
+
+    protected = sorted({t for c in contract.constraints for t in rollout._extract_protected_terms(c)})
+    compactions = rollout.detect_compactions(lines)
+    traces = rollout.extract_tool_traces(lines)
+
+    inspector = None
+    git_note = "not checked (no --repo given)"
+    if repo_path:
+        try:
+            inspector = GitInspector(repo_path)
+            git_note = f"{repo_path} @ {(inspector.head_sha() or 'no commits')[:8]}"
+        except GitError as exc:
+            git_note = f"unavailable ({exc})"
+
+    result = {
+        "session": os.path.basename(session_path),
+        "objective": contract.objective,
+        "constraints": contract.constraints,
+        "protected_paths": protected,
+        "tool_calls": len(traces),
+        "git": git_note,
+        "compaction": None,
+        "drift": [],
+        "violations": [],
+    }
+
+    if not compactions:
+        result["note"] = "No compaction in this session — nothing to verify."
+        # Even without a compaction, git can still show protected-path damage.
+        if inspector:
+            result["violations"] = verify_violations([], inspector, protected)
+        return result
+
+    scorer = build_scorer_from_env()
+    result["scorer"] = type(scorer).__name__
+    result["compaction_count"] = len(compactions)
+
+    # Analyse EVERY compaction, not just the first. Loss compounds across
+    # repeated compactions and the model does not know an earlier one occurred.
+    per_compaction = rollout.analyse_session(contract, lines, scorer=scorer)
+    result["compactions"] = []
+    all_violations = []
+
+    for rec in per_compaction:
+        verified = verify_violations(rec["violations"], inspector, protected)
+        all_violations.extend(verified)
+        result["compactions"].append({
+            "ordinal": rec["ordinal"],
+            "at": rec["at"],
+            "summary": rec["summary"],
+            "drift": rec["drift"],
+            "violations": verified,
+        })
+        for d in rec["drift"]:
+            result["drift"].append({**d, "at_compaction": rec["ordinal"]})
+
+    # Protected-path changes git found that no segment claimed.
+    claimed = {v.get("violating_input", {}).get("path", "") for v in all_violations}
+    for extra in verify_violations([], inspector, protected):
+        if extra.get("violating_input", {}).get("path") not in claimed:
+            all_violations.append(extra)
+
+    result["violations"] = all_violations
+    result["compaction"] = {"at": per_compaction[0]["at"], "summary": per_compaction[0]["summary"]}
+    return result
+
+
+def render(r: dict) -> None:
+    print(f"\n{B}CodeAnchor — session recovery{X}")
+    print(f"{DIM}session:{X} {r['session']}")
+    print(f"{DIM}git:    {X} {r['git']}")
+    if r.get("scorer"):
+        print(f"{DIM}scorer: {X} {r['scorer']}")
+
+    print(f"\n{B}Task contract{X}")
+    print(f"  objective: {(r['objective'] or '(none found)')[:150]}")
+    for c in r["constraints"]:
+        print(f"  constraint: {c[:130]}")
+    if r["protected_paths"]:
+        print(f"  protected: {', '.join(r['protected_paths'])}")
+
+    if r.get("note"):
+        print(f"\n{Y}{r['note']}{X}")
+    elif r.get("compactions"):
+        n = r.get("compaction_count", len(r["compactions"]))
+        print(f"\n{B}Compactions{X} ({n} in this session)")
+        for c in r["compactions"]:
+            status = ""
+            if c["drift"]:
+                status = f"  {Y}constraint dropped{X}"
+                if any(d.get("compounding") for d in c["drift"]):
+                    status = f"  {R}constraint still lost (compounding){X}"
+            elif c["violations"]:
+                status = f"  {R}violation in this segment{X}"
+            else:
+                status = f"  {G}clean{X}"
+            print(f"  [{c['ordinal']}/{n}] {c['at']}{status}")
+            print(f"       {DIM}{c['summary'][:150]}{X}")
+            for v in c["violations"]:
+                print(f"       {R}-> {v['violating_input'].get('path','')}{X}")
+
+    if r["drift"]:
+        print(f"\n{Y}Drift detected{X}")
+        for d in r["drift"]:
+            tag = f" {R}[COMPOUNDING]{X}" if d.get("compounding") else ""
+            where = f" (compaction {d['at_compaction']})" if d.get("at_compaction") else ""
+            print(f"  ! {d['rationale']}{where}{tag}")
+            print(f"    {DIM}constraint: {d['constraint'][:110]}{X}")
+
+    if r["violations"]:
+        print(f"\n{R}Constraint violations{X}")
+        for v in r["violations"]:
+            label = {
+                "rollout+git": f"{R}session log + git agree{X}",
+                "rollout-only": f"{Y}session log only, git could not confirm{X}",
+                "git-only": f"{R}git only — NOT in the session log{X}",
+            }.get(v.get("evidence", ""), v.get("evidence", ""))
+            print(f"  ✗ {v['violating_input'].get('path', '')}  [{label}]")
+            print(f"    {DIM}by {v['violating_tool']} — {v['constraint'][:100]}{X}")
+    elif not r.get("note"):
+        print(f"\n{G}No constraint violations found.{X}")
+
+    bad = bool(r["violations"] or r["drift"])
+    print(f"\n{(R + 'RESULT: task contract was NOT honoured after recovery' + X) if bad else (G + 'RESULT: task contract honoured' + X)}\n")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="codeanchor", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd")
+
+    sub.add_parser("demo", help="run the bundled demo (no credentials required)")
+    sub.add_parser("sessions", help="list Codex sessions found on this machine")
+
+    rec = sub.add_parser("recover", help="analyse a Codex session")
+    rec.add_argument("--session", help="path to a rollout-*.jsonl")
+    rec.add_argument("--latest", action="store_true", help="use the most recent Codex session")
+    rec.add_argument("--repo", help="git working tree to cross-check against")
+    rec.add_argument("--json", action="store_true", help="machine-readable output")
+
+    args = ap.parse_args()
+
+    if args.cmd == "sessions":
+        found = find_sessions()
+        if not found:
+            print(f"No Codex sessions under {CODEX_HOME}. Run a Codex session first.")
+            return 2
+        for p in found[:20]:
+            print(p)
+        return 0
+
+    if args.cmd == "demo":
+        session = os.path.join(ROOT, "fixtures", "sample_rollout.jsonl")
+        repo = os.path.join(ROOT, "sample-app")
+        # sample-app ships without .git (see scripts/setup_sample_app.sh); build
+        # it on first run so `codeanchor demo` works straight from a clone.
+        if os.path.isdir(repo) and not os.path.isdir(os.path.join(repo, ".git")):
+            setup = os.path.join(ROOT, "scripts", "setup_sample_app.sh")
+            if os.path.exists(setup):
+                import subprocess
+                print(f"{DIM}First run — initialising sample-app...{X}")
+                subprocess.run(["bash", setup], capture_output=True)
+        print(f"{DIM}Demo mode — bundled fixture, no credentials needed.{X}")
+        render(analyse(session, repo if os.path.isdir(os.path.join(repo, ".git")) else None))
+        return 0  # demo always exits 0; it's a demonstration, not a gate
+
+    if args.cmd == "recover":
+        if args.latest:
+            found = find_sessions()
+            if not found:
+                print(f"No Codex sessions under {CODEX_HOME}.", file=sys.stderr)
+                return 2
+            session = found[0]
+        elif args.session:
+            session = args.session
+        else:
+            rec.error("give --session <path> or --latest")
+        if not os.path.exists(session):
+            print(f"No such session: {session}", file=sys.stderr)
+            return 2
+
+        result = analyse(session, args.repo)
+        if args.json:
+            print(json.dumps(result, indent=2, default=str))
+        else:
+            render(result)
+        return 1 if (result["violations"] or result["drift"]) else 0
+
+    ap.print_help()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
