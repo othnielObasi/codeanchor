@@ -17,8 +17,10 @@ from tracememory.adapters.git_inspect import (
     GitError,
     GitInspector,
     reconcile,
+    session_start_ref_from_lines,
     verify_violations,
 )
+from tracememory.adapters.codex_rollout import RolloutLine
 from tracememory.adapters.drift_scoring import (
     DriftScoreParseError,
     GPT56DriftScorer,
@@ -95,6 +97,37 @@ def test_file_changed_helper(repo):
 def test_diff_for_returns_patch_text(repo):
     _edit(repo, "billing/refunds.py", "\n# marker-xyz\n")
     assert "marker-xyz" in GitInspector(repo).diff_for("billing/refunds.py")
+
+
+def test_session_start_ref_includes_committed_session_changes(repo):
+    _edit(repo, "billing/refunds.py", "\n# before session\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "pre-existing work")
+    session_start = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    _edit(repo, "billing/auth/eligibility.py", "\n# changed during session\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "session work")
+
+    assert GitInspector(repo).changed_files() == []
+    paths = [change.path for change in GitInspector(repo, session_start).changed_files()]
+    assert paths == ["billing/auth/eligibility.py"]
+
+
+def test_invalid_session_start_ref_falls_back_to_working_tree(repo):
+    _edit(repo, "billing/refunds.py", "\n# dirty\n")
+    inspector = GitInspector(repo, "not-a-real-ref")
+    assert inspector.session_start_ref is None
+    assert [change.path for change in inspector.changed_files()] == ["billing/refunds.py"]
+
+
+def test_extracts_session_start_ref_from_both_metadata_shapes():
+    legacy = [RolloutLine("t", {"type": "session_meta", "git_sha": "abc123"})]
+    current = [RolloutLine("t", {"type": "session_meta", "git": {"commit_hash": "def456"}})]
+    assert session_start_ref_from_lines(legacy) == "abc123"
+    assert session_start_ref_from_lines(current) == "def456"
 
 
 # --- reconciliation ----------------------------------------------------------

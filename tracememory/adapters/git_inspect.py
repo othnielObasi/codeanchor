@@ -68,10 +68,12 @@ class Reconciliation:
 class GitInspector:
     """Read-only inspection of a git working tree."""
 
-    def __init__(self, repo_path: str):
+    def __init__(self, repo_path: str, session_start_ref: str | None = None):
         self.repo_path = os.path.abspath(repo_path)
         if not os.path.isdir(os.path.join(self.repo_path, ".git")):
             raise GitError(f"not a git repository: {self.repo_path}")
+        self.session_start_ref: str | None = None
+        self.set_session_start_ref(session_start_ref)
 
     # -- plumbing ----------------------------------------------------------
 
@@ -119,6 +121,17 @@ class GitInspector:
         except GitError:
             return False
 
+    def set_session_start_ref(self, ref: str | None) -> None:
+        """Use a valid session-start commit as the default comparison base."""
+        self.session_start_ref = None
+        if not ref:
+            return
+        try:
+            self._run("rev-parse", "--verify", f"{ref}^{{commit}}")
+        except GitError:
+            return
+        self.session_start_ref = ref
+
     def head_sha(self) -> str:
         try:
             return self._run("rev-parse", "HEAD").strip()
@@ -136,9 +149,10 @@ class GitInspector:
         """
         changes: dict[str, FileChange] = {}
 
+        effective_ref = since_ref if since_ref is not None else self.session_start_ref
         diff_args = ["diff", "--numstat"]
-        if since_ref:
-            diff_args.append(since_ref)
+        if effective_ref:
+            diff_args.append(effective_ref)
         for line in self._run(*diff_args).splitlines():
             parts = line.split("\t")
             if len(parts) < 3:
@@ -190,14 +204,29 @@ class GitInspector:
 
     def diff_for(self, path: str, since_ref: str | None = None, max_chars: int = 4000) -> str:
         args = ["diff"]
-        if since_ref:
-            args.append(since_ref)
+        effective_ref = since_ref if since_ref is not None else self.session_start_ref
+        if effective_ref:
+            args.append(effective_ref)
         args += ["--", path]
         try:
             out = self._run(*args)
         except GitError:
             return ""
         return out[:max_chars]
+
+
+def session_start_ref_from_lines(lines: list[Any]) -> str | None:
+    """Read the starting commit from legacy or current normalized session metadata."""
+    for line in lines:
+        item = getattr(line, "item", {})
+        if not isinstance(item, dict) or item.get("type") != "session_meta":
+            continue
+        direct = item.get("git_sha")
+        git_meta = item.get("git") or {}
+        nested = git_meta.get("commit_hash") if isinstance(git_meta, dict) else None
+        ref = direct or nested
+        return str(ref) if ref else None
+    return None
 
 
 # --- reconciliation ---------------------------------------------------------

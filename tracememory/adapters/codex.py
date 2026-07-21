@@ -38,6 +38,10 @@ class TraceMemoryCodexAdapter:
     def ingest_session(self) -> dict[str, Any]:
         self._lines = rollout.parse_rollout_file(self.session_path)
         self._contract = rollout.extract_task_contract(self._lines)
+        if self.inspector:
+            from .git_inspect import session_start_ref_from_lines
+
+            self.inspector.set_session_start_ref(session_start_ref_from_lines(self._lines))
 
         self.client.record_event(
             self.task_id,
