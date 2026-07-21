@@ -16,9 +16,14 @@ or to ContextHealthService directly.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Iterator
 
+
+UNAVAILABLE_COMPACTION_SUMMARY = (
+    "[Compaction summary unavailable: current Codex rollout stores it encrypted or omitted.]"
+)
 
 # --- Parsing -----------------------------------------------------------------
 
@@ -45,8 +50,81 @@ def parse_rollout_file(path: str) -> list[RolloutLine]:
             if not raw:
                 continue
             record = json.loads(raw)
-            lines.append(RolloutLine(timestamp=record["timestamp"], item=record["item"]))
+            timestamp = record["timestamp"]
+            if "item" in record:
+                # Legacy fixture / older exported shape.
+                item = record["item"]
+            else:
+                # Current Codex on-disk shape: {timestamp, type, payload}.
+                item = _normalise_real_record(record.get("type", "unknown"), record.get("payload") or {})
+            lines.append(RolloutLine(timestamp=timestamp, item=item))
     return lines
+
+
+def _json_object_or_raw(value: Any, field: str) -> dict[str, Any]:
+    """Decode JSON-string tool data while retaining free-form custom-tool data."""
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return {field: value}
+    try:
+        decoded = json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        decoded = None
+    if isinstance(decoded, dict):
+        return decoded
+
+    result: dict[str, Any] = {field: value}
+    # Current custom apply_patch calls can carry the patch as free-form text.
+    match = re.search(r"^\*\*\* (?:Update|Add|Delete) File:\s*(.+?)\s*$", value, re.M)
+    if match:
+        result["path"] = match.group(1).strip()
+    return result
+
+
+def _normalise_real_record(record_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Map current {timestamp,type,payload} records to the adapter's stable shape."""
+    if record_type == "response_item":
+        subtype = payload.get("type", "unknown")
+        if subtype == "message":
+            return {
+                "type": "response_item",
+                "role": payload.get("role", ""),
+                "content": payload.get("content") or [],
+            }
+        if subtype in ("function_call", "custom_tool_call"):
+            raw_input = payload.get("arguments") if subtype == "function_call" else payload.get("input")
+            return {
+                "type": "response_item",
+                "content": [{
+                    "type": "tool_call",
+                    "tool_name": payload.get("name", "unknown"),
+                    "input": _json_object_or_raw(raw_input, "arguments" if subtype == "function_call" else "input"),
+                    "call_id": payload.get("call_id") or payload.get("id"),
+                }],
+            }
+        if subtype in ("function_call_output", "custom_tool_call_output"):
+            return {
+                "type": "event_msg",
+                "msg": {
+                    "type": "tool_result",
+                    "call_id": payload.get("call_id") or payload.get("id"),
+                    "output": _json_object_or_raw(payload.get("output"), "output"),
+                },
+            }
+        # Reasoning and other response items are retained but ignored by the
+        # extractors unless support is explicitly added later.
+        return {"type": "response_item", "response_type": subtype, "content": payload.get("content") or []}
+
+    if record_type == "event_msg":
+        return {"type": "event_msg", "msg": payload}
+    if record_type == "compacted":
+        return {
+            "type": "compacted",
+            "summary": payload.get("message") or UNAVAILABLE_COMPACTION_SUMMARY,
+            "replacement_history": payload.get("replacement_history") or [],
+        }
+    return {"type": record_type, **payload}
 
 
 # --- Task contract extraction --------------------------------------------------
@@ -63,12 +141,24 @@ def extract_task_contract(lines: list[RolloutLine]) -> TaskContract:
     """Derive a task contract from the first user message and the first
     thread_goal_updated event (Codex's own extracted "Goals" metadata field)."""
     raw_instruction = ""
+    # The current schema emits the user's submitted prompt as an event_msg.
+    # Prefer that over response_item messages, which may include injected
+    # developer/environment context alongside the actual prompt.
     for rl in lines:
+        msg = rl.item.get("msg", {}) if rl.item_type == "event_msg" else {}
+        if msg.get("type") == "user_message" and isinstance(msg.get("message"), str):
+            raw_instruction = msg["message"]
+            break
+
+    for rl in lines:
+        if raw_instruction:
+            break
         if rl.item_type == "response_item" and rl.item.get("role") == "user":
             for block in rl.item.get("content", []):
                 if block.get("type") == "input_text":
-                    raw_instruction = block["text"]
-                    break
+                    raw_instruction = block.get("text", "")
+                    if raw_instruction:
+                        break
             if raw_instruction:
                 break
 
@@ -293,20 +383,30 @@ class ExtractedToolTrace:
 
 
 def extract_tool_traces(lines: list[RolloutLine]) -> list[ExtractedToolTrace]:
-    """Pairs tool_call response_items with their subsequent tool_result event_msg."""
+    """Pair legacy sequential calls and current call_id-addressed tool results."""
     traces: list[ExtractedToolTrace] = []
-    pending_call: dict[str, Any] | None = None
-    pending_ts = ""
+    pending_by_id: dict[str, tuple[dict[str, Any], str]] = {}
+    pending_sequential: list[tuple[dict[str, Any], str]] = []
 
     for rl in lines:
         if rl.item_type == "response_item":
             for block in rl.item.get("content", []):
                 if block.get("type") == "tool_call":
-                    pending_call = block
-                    pending_ts = rl.timestamp
+                    call_id = block.get("call_id")
+                    if call_id:
+                        pending_by_id[str(call_id)] = (block, rl.timestamp)
+                    else:
+                        pending_sequential.append((block, rl.timestamp))
         elif rl.item_type == "event_msg":
             msg = rl.item.get("msg", {})
-            if msg.get("type") == "tool_result" and pending_call is not None:
+            if msg.get("type") == "tool_result":
+                call_id = msg.get("call_id")
+                pending = pending_by_id.pop(str(call_id), None) if call_id else None
+                if pending is None and pending_sequential:
+                    pending = pending_sequential.pop(0)
+                if pending is None:
+                    continue
+                pending_call, pending_ts = pending
                 tool_name = pending_call.get("tool_name", "unknown")
                 tool_type = "write" if tool_name in ("apply_patch", "shell") and _is_write(pending_call) else "read"
                 traces.append(
@@ -318,7 +418,6 @@ def extract_tool_traces(lines: list[RolloutLine]) -> list[ExtractedToolTrace]:
                         timestamp=pending_ts,
                     )
                 )
-                pending_call = None
     return traces
 
 

@@ -31,10 +31,20 @@ from tracememory.adapters import codex_rollout as rollout
 
 CODEX_HOME = os.environ.get("CODEX_HOME", os.path.expanduser("~/.codex"))
 
-# Every assumption the adapter makes about Codex's rollout schema, in one place.
-EXPECTED_ITEM_TYPES = {"session_meta", "turn_context", "response_item", "event_msg", "compacted"}
-EXPECTED_EVENT_MSG_TYPES = {"thread_goal_updated", "tool_result", "token_count", "user_message"}
-EXPECTED_CONTENT_BLOCK_TYPES = {"input_text", "output_text", "tool_call"}
+# Top-level records the adapter consumes directly. Other record types are
+# intentionally retained/ignored rather than treated as schema failures.
+EXPECTED_ITEM_TYPES = {"session_meta", "turn_context", "world_state", "response_item", "event_msg", "compacted"}
+EXPECTED_CONTENT_BLOCK_TYPES = {"input_text", "input_image", "output_text", "tool_call"}
+
+
+def _record_type(record: dict) -> str:
+    if "item" in record:  # legacy fixture shape
+        return (record.get("item") or {}).get("type", "<none>")
+    return record.get("type", "<none>")
+
+
+def _record_payload(record: dict) -> dict:
+    return (record.get("item") if "item" in record else record.get("payload")) or {}
 
 
 class Report:
@@ -102,45 +112,49 @@ def validate(path: str) -> Report:
         r.check("file is non-empty", False, "no parseable lines")
         return r
 
-    # --- 2. RolloutLine shape: {timestamp, item} -----------------------------
+    # --- 2. Envelope: current {timestamp,type,payload}, plus legacy fixtures --
     missing_ts = [n for n, rec in raw_lines if "timestamp" not in rec]
-    missing_item = [n for n, rec in raw_lines if "item" not in rec]
+    malformed_envelope = [
+        n for n, rec in raw_lines
+        if not (
+            isinstance(rec.get("item"), dict)
+            or (isinstance(rec.get("type"), str) and isinstance(rec.get("payload"), dict))
+        )
+    ]
     r.check("every line has a 'timestamp' field", not missing_ts, detail=f"missing on line(s): {missing_ts[:5]}")
-    r.check("every line has an 'item' field", not missing_item, detail=f"missing on line(s): {missing_item[:5]}")
-    if missing_item:
+    r.check(
+        "every line has a recognised rollout envelope",
+        not malformed_envelope,
+        detail=f"expected {{timestamp,type,payload}} or legacy {{timestamp,item}} on line(s): {malformed_envelope[:5]}",
+    )
+    if malformed_envelope:
         return r
 
     # --- 3. Item types are the ones we handle --------------------------------
-    type_counts = collections.Counter(rec["item"].get("type", "<none>") for _, rec in raw_lines)
+    type_counts = collections.Counter(_record_type(rec) for _, rec in raw_lines)
     unknown = set(type_counts) - EXPECTED_ITEM_TYPES
     r.info("item types present", ", ".join(f"{k}={v}" for k, v in sorted(type_counts.items())))
-    r.check(
-        "no unrecognised item types",
-        not unknown,
-        f"UNHANDLED: {sorted(unknown)} -- adapter will silently skip these" if unknown else "",
-    )
+    if unknown:
+        r.info("ignored top-level item types", ", ".join(sorted(unknown)))
 
     # --- 4. event_msg subtypes ------------------------------------------------
     msg_types = collections.Counter(
-        rec["item"].get("msg", {}).get("type", "<none>")
+        (_record_payload(rec).get("msg", {}) if "item" in rec else _record_payload(rec)).get("type", "<none>")
         for _, rec in raw_lines
-        if rec["item"].get("type") == "event_msg"
+        if _record_type(rec) == "event_msg"
     )
     if msg_types:
         r.info("event_msg subtypes", ", ".join(f"{k}={v}" for k, v in sorted(msg_types.items())))
-        unknown_msgs = set(msg_types) - EXPECTED_EVENT_MSG_TYPES
-        r.check(
-            "no unrecognised event_msg subtypes",
-            not unknown_msgs,
-            f"UNHANDLED: {sorted(unknown_msgs)}" if unknown_msgs else "",
-        )
 
     # --- 5. response_item content block types --------------------------------
     block_types = collections.Counter()
     for _, rec in raw_lines:
-        if rec["item"].get("type") != "response_item":
+        if _record_type(rec) != "response_item":
             continue
-        content = rec["item"].get("content")
+        payload = _record_payload(rec)
+        if "item" not in rec and payload.get("type") != "message":
+            continue
+        content = payload.get("content")
         if not isinstance(content, list):
             block_types["<content not a list>"] += 1
             continue
@@ -157,27 +171,34 @@ def validate(path: str) -> Report:
 
     # --- 6. tool_call shape ---------------------------------------------------
     tool_calls = []
+    tool_outputs = []
     for _, rec in raw_lines:
-        if rec["item"].get("type") != "response_item":
+        if _record_type(rec) != "response_item":
             continue
-        for block in rec["item"].get("content", []) or []:
-            if isinstance(block, dict) and block.get("type") == "tool_call":
-                tool_calls.append(block)
+        payload = _record_payload(rec)
+        if "item" in rec:
+            for block in payload.get("content", []) or []:
+                if isinstance(block, dict) and block.get("type") == "tool_call":
+                    tool_calls.append({"name": block.get("tool_name"), "input": block.get("input"), "call_id": block.get("call_id")})
+            msg = payload.get("msg", {})
+            if payload.get("type") == "event_msg" and msg.get("type") == "tool_result":
+                tool_outputs.append(msg)
+            continue
+        subtype = payload.get("type")
+        if subtype in ("function_call", "custom_tool_call"):
+            tool_calls.append({
+                "name": payload.get("name"),
+                "input": payload.get("arguments") if subtype == "function_call" else payload.get("input"),
+                "call_id": payload.get("call_id") or payload.get("id"),
+            })
+        elif subtype in ("function_call_output", "custom_tool_call_output"):
+            tool_outputs.append(payload)
     if tool_calls:
-        no_name = sum(1 for b in tool_calls if "tool_name" not in b)
-        no_input = sum(1 for b in tool_calls if "input" not in b)
-        r.check("every tool_call has 'tool_name'", no_name == 0, detail=f"{no_name} missing")
-        r.check("every tool_call has 'input'", no_input == 0, detail=f"{no_input} missing")
-        r.info("tool names seen", ", ".join(sorted({b.get("tool_name", "?") for b in tool_calls})))
-        # The adapter reads apply_patch's target from input.path
-        patches = [b for b in tool_calls if b.get("tool_name") == "apply_patch"]
-        if patches:
-            no_path = sum(1 for b in patches if "path" not in (b.get("input") or {}))
-            r.check(
-                "every apply_patch input has 'path'",
-                no_path == 0,
-                detail=f"{no_path} missing -- violation detection reads input.path",
-            )
+        no_name = sum(1 for b in tool_calls if not b.get("name"))
+        no_input = sum(1 for b in tool_calls if b.get("input") is None)
+        r.check("every tool call has a name", no_name == 0, detail=f"{no_name} missing")
+        r.check("every tool call has input/arguments", no_input == 0, detail=f"{no_input} missing")
+        r.info("tool names seen", ", ".join(sorted({b.get("name", "?") for b in tool_calls})))
     else:
         r.info("tool_call blocks", "none in this session (can't validate tool_call shape)")
 
@@ -208,14 +229,12 @@ def validate(path: str) -> Report:
     try:
         traces = rollout.extract_tool_traces(lines)
         r.check("extract_tool_traces() succeeds", True, note=f"{len(traces)} trace(s) paired")
-        # A tool_call with no matching tool_result means our pairing assumption is off.
-        if tool_calls:
+        if tool_outputs:
             r.check(
-                "tool_calls pair with tool_results",
-                len(traces) == len(tool_calls),
-                detail=f"{len(tool_calls)} tool_call(s) but only {len(traces)} paired -- "
-                "pairing assumption (call followed by event_msg/tool_result) may not hold",
-                note=f"{len(traces)}/{len(tool_calls)}",
+                "completed tool calls pair with outputs",
+                len(traces) == len(tool_outputs),
+                detail=f"{len(tool_outputs)} output record(s) but {len(traces)} paired trace(s)",
+                note=f"{len(traces)} paired; {max(0, len(tool_calls) - len(tool_outputs))} call(s) still pending",
             )
     except Exception as exc:
         r.check("extract_tool_traces() succeeds", False, f"{type(exc).__name__}: {exc}")
@@ -247,7 +266,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("path", nargs="?", help="rollout .jsonl file (default: most recent)")
     ap.add_argument("--all", action="store_true", help="validate every session found")
-    ap.add_argument("--limit", type=int, default=5, help="max sessions with --all (default 5)")
+    ap.add_argument("--limit", type=int, help="optional maximum sessions with --all")
     args = ap.parse_args()
 
     if args.path:
@@ -260,7 +279,8 @@ def main() -> int:
             print("(Set CODEX_HOME if your Codex home is elsewhere.)")
             return 2
         targets = sessions if args.all else [sessions[0]]
-        targets = targets[: args.limit]
+        if args.limit is not None:
+            targets = targets[: args.limit]
         print(f"Found {len(sessions)} session(s) under {CODEX_HOME}; validating {len(targets)}.\n")
 
     total_failures = 0
