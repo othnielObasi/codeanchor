@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""Non-blocking Codex Stop hook for CodeAnchor contract verification."""
+from __future__ import annotations
+
+import glob
+import importlib.machinery
+import importlib.util
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any
+
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
+
+
+def _load_analyse():
+    """Load analyse() from the extensionless bin/codeanchor CLI."""
+    loader = importlib.machinery.SourceFileLoader("codeanchor_cli", str(HERE / "codeanchor"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None:
+        raise ImportError("could not load bin/codeanchor")
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module.analyse
+
+
+def _session_path(payload: dict[str, Any]) -> str | None:
+    # transcript_path is the documented Codex hook field. The aliases make the
+    # hook tolerant of wrappers that expose the rollout more explicitly.
+    for key in ("rollout_path", "session_path", "transcript_path"):
+        value = payload.get(key)
+        if isinstance(value, str) and os.path.isfile(os.path.expanduser(value)):
+            return os.path.abspath(os.path.expanduser(value))
+
+    session_id = payload.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    codex_home = os.environ.get("CODEX_HOME", os.path.expanduser("~/.codex"))
+    matches: list[str] = []
+    for folder in ("sessions", "archived_sessions"):
+        pattern = os.path.join(codex_home, folder, "**", f"*{glob.escape(session_id)}*.jsonl")
+        matches.extend(glob.glob(pattern, recursive=True))
+    return max(matches, key=os.path.getmtime) if matches else None
+
+
+def _repo_path(payload: dict[str, Any]) -> str | None:
+    cwd = payload.get("cwd")
+    if not isinstance(cwd, str) or not os.path.isdir(os.path.expanduser(cwd)):
+        return None
+    return os.path.abspath(os.path.expanduser(cwd))
+
+
+def _message(result: dict[str, Any]) -> str:
+    violations = result.get("violations") or []
+    drift = result.get("drift") or []
+    if not violations and not drift:
+        return "CodeAnchor: task contract honoured; no constraint violations found."
+
+    lines = ["CodeAnchor: task contract was NOT honoured."]
+    if violations:
+        lines.append("Violations:")
+        labels = {
+            "rollout+git": "log+git",
+            "rollout-only": "log-only",
+            "git-only": "git-only",
+        }
+        for violation in violations:
+            source = labels.get(violation.get("evidence"), violation.get("evidence") or "unknown")
+            detail = violation.get("violating_input") or {}
+            subject = detail.get("path") or violation.get("constraint") or "unknown constraint"
+            lines.append(f"- {subject} [{source}]")
+    if drift:
+        lines.append(f"Constraint drift requiring review: {len(drift)} finding(s).")
+    return "\n".join(lines)
+
+
+def _response(system_message: str) -> dict[str, Any]:
+    # A Stop hook blocks only when it asks Codex not to continue. Verification
+    # is advisory, so every response explicitly permits the turn to finish.
+    return {"continue": True, "systemMessage": system_message}
+
+
+def main() -> int:
+    try:
+        raw = sys.stdin.read()
+        payload = json.loads(raw) if raw.strip() else {}
+        if not isinstance(payload, dict):
+            raise ValueError("hook payload must be a JSON object")
+        session = _session_path(payload)
+        if session is None:
+            response = _response("CodeAnchor: verification unavailable; no session rollout path was found.")
+        else:
+            # Hooks must not turn a Stop event into a network wait. analyse()
+            # remains unchanged; this invocation selects its keyless scorer.
+            api_key = os.environ.pop("OPENAI_API_KEY", None)
+            try:
+                result = _load_analyse()(session, _repo_path(payload))
+            finally:
+                if api_key is not None:
+                    os.environ["OPENAI_API_KEY"] = api_key
+            response = _response(_message(result))
+    except Exception as exc:
+        response = _response(
+            f"CodeAnchor: verification unavailable ({type(exc).__name__}); the Stop event was not blocked."
+        )
+
+    print(json.dumps(response, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except BaseException:
+        # Last-resort protocol guarantee: even unusual runtime failures must not
+        # turn this advisory hook into a blocker.
+        print(json.dumps(_response("CodeAnchor: verification unavailable; the Stop event was not blocked.")))
+    raise SystemExit(0)

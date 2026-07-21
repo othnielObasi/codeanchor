@@ -14,6 +14,9 @@ makes the boundary explicit; it should feed the README's compliance section.
 | `scripts/validate_against_real_rollout.py` | 284 | Schema validation vs. a real `~/.codex` session |
 | `scripts/patch_ui_codex_tab.py` | 220 | Idempotent UI patch (`--check` / `--revert`) |
 | `scripts/verify_ui_patch.js` | 41 | Renders the panel; gates on CSS class validity |
+| `bin/codeanchor-hook` | â€” | Advisory Codex Stop hook for automatic task-contract verification |
+| `scripts/install_codex_hook.py` | â€” | Idempotent user-level hook installer (`--uninstall` / `--dry-run`) |
+| `tests/test_stop_hook.py` | â€” | Subprocess coverage for hook safety, evidence labels, and installation |
 | `tests/test_codex_adapter.py` | 106 | End-to-end: parse → drift → recovery brief |
 | `tests/test_drift_scoring.py` | 105 | Both scorers, incl. fake GPT-5.6 client |
 | `tests/test_regressions.py` | 259 | Seven named bugs from REVIEW_NOTES.md |
